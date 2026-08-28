@@ -1,6 +1,351 @@
 "use client";
 
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef } from "react";
+import * as SpeechSDK from "microsoft-cognitiveservices-speech-sdk";
+
+// The lesson: swap these for any words/phrases you want learners to practice.
+const LESSON_WORDS = [
+  "I feel happy when the sun is shining.",
+  "She painted a beautiful picture of the mountains.",
+  "This chair is very comfortable to sit in.",
+  "Every challenge is an opportunity to learn.",
+  "We have a team meeting every Wednesday morning.",
+  "He added a fresh vegetable to the salad.",
+  "My birthday is in the middle of February.",
+  "Please put the milk back in the refrigerator.",
+  "The children were happy to see the puppy.",
+  "The beautiful garden was full of colorful flowers.",
+  "I bought a comfortable pair of running shoes.",
+  "Thank you for giving me this wonderful opportunity.",
+  "The library is closed next Wednesday for repairs.",
+  "A carrot is my favorite vegetable to snack on.",
+  "It often snows here during the month of February.",
+  "The refrigerator keeps our food cold and fresh.",
+  "Getting a good night's sleep makes me happy.",
+  "What a beautiful and peaceful evening it is.",
+  "Make yourself comfortable while I make some tea.",
+  "This new job is a great opportunity for my career.",
+];
+
+const REFERENCE_VOICE = "en-US-JennyNeural";
+
+async function getSpeechConfig() {
+  const res = await fetch("/api/token");
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || "Failed to get Azure token");
+  return SpeechSDK.SpeechConfig.fromAuthorizationToken(data.token, data.region);
+}
+
+type WordScore = {
+  word: string;
+  accuracy: number; // 0-100 for this specific word
+  errorType: string; // "None" | "Mispronunciation" | "Omission" | ...
+};
+
+// 1–5 rating: the word has to MATCH (meaning) to score 3+, and pronunciation
+// quality decides how high. A well-pronounced wrong word tops out at 2.
+function starRating(matched: boolean, pronScore: number): number {
+  if (matched) {
+    if (pronScore >= 85) return 5;
+    if (pronScore >= 70) return 4;
+    if (pronScore >= 50) return 3;
+    return 2;
+  }
+  return pronScore >= 60 ? 2 : 1;
+}
+
+const RATING_LABELS = [
+  "",
+  "Try again",
+  "Almost — keep practicing",
+  "Good 👍",
+  "Great!",
+  "Perfect! 🎉",
+];
+
+const ratingColor = (r: number) =>
+  r >= 4 ? "#22c55e" : r === 3 ? "#eab308" : "#ef4444";
+
+type Assessment = {
+  recognizedText: string;
+  accuracy: number;
+  fluency: number;
+  completeness: number;
+  pronScore: number; // overall
+  words: WordScore[];
+};
+
+export default function Practice() {
+  const [index, setIndex] = useState(0);
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState("");
+  const [result, setResult] = useState<Assessment | null>(null);
+  const recognizerRef = useRef<SpeechSDK.SpeechRecognizer | null>(null);
+
+  const currentWord = LESSON_WORDS[index];
+
+  // ---- Play the correct pronunciation (so the learner hears the target) ----
+  async function playReference() {
+    setStatus("Loading correct pronunciation…");
+    try {
+      const speechConfig = await getSpeechConfig();
+      speechConfig.speechSynthesisVoiceName = REFERENCE_VOICE;
+      // Pass `null` (not `undefined`) so the SDK does NOT auto-play through the
+      // default speaker. With `undefined` it plays automatically AND we play the
+      // blob manually below, so the same audio overlaps itself — that's the echo.
+      const synth = new SpeechSDK.SpeechSynthesizer(speechConfig, null);
+      synth.speakTextAsync(
+        currentWord,
+        (r) => {
+          if (r.reason === SpeechSDK.ResultReason.SynthesizingAudioCompleted) {
+            const blob = new Blob([r.audioData], { type: "audio/mpeg" });
+            const url = URL.createObjectURL(blob);
+            const audio = new Audio(url);
+            audio.onended = () => URL.revokeObjectURL(url);
+            audio.play();
+            setStatus("");
+          }
+          synth.close();
+        },
+        (e) => {
+          setStatus("Error: " + e);
+          synth.close();
+        }
+      );
+    } catch (err) {
+      setStatus("Error: " + (err as Error).message);
+    }
+  }
+
+  // ---- Record the learner and score their pronunciation against currentWord ----
+  async function startAssessment() {
+    setResult(null);
+    setBusy(true);
+    setStatus("🎤 Listening… say the word clearly.");
+
+    try {
+      const speechConfig = await getSpeechConfig();
+      speechConfig.speechRecognitionLanguage = "en-US";
+      // Give the learner time to start speaking, and don't cut short words off.
+      speechConfig.setProperty(
+        SpeechSDK.PropertyId.SpeechServiceConnection_InitialSilenceTimeoutMs,
+        "10000"
+      );
+      speechConfig.setProperty(
+        SpeechSDK.PropertyId.SpeechServiceConnection_EndSilenceTimeoutMs,
+        "1500"
+      );
+      const audioConfig = SpeechSDK.AudioConfig.fromDefaultMicrophoneInput();
+      const recognizer = new SpeechSDK.SpeechRecognizer(speechConfig, audioConfig);
+      recognizerRef.current = recognizer;
+
+      // Bias recognition toward the expected word — without this, isolated
+      // short words are often misheard as homophones or return NoMatch.
+      SpeechSDK.PhraseListGrammar.fromRecognizer(recognizer).addPhrase(currentWord);
+
+      // The heart of it: tell Azure the word we EXPECT, and ask it to grade
+      // the learner's speech against that reference.
+      const pronConfig = new SpeechSDK.PronunciationAssessmentConfig(
+        currentWord,
+        SpeechSDK.PronunciationAssessmentGradingSystem.HundredMark,
+        SpeechSDK.PronunciationAssessmentGranularity.Phoneme,
+        true // enableMiscue: detects extra/missing words
+      );
+      pronConfig.applyTo(recognizer);
+
+      recognizer.recognizeOnceAsync(
+        (r) => {
+          if (r.reason === SpeechSDK.ResultReason.RecognizedSpeech) {
+            const pa = SpeechSDK.PronunciationAssessmentResult.fromResult(r);
+            const words: WordScore[] = (pa.detailResult?.Words || []).map((w) => ({
+              word: w.Word,
+              accuracy: Math.round(w.PronunciationAssessment?.AccuracyScore ?? 0),
+              errorType: w.PronunciationAssessment?.ErrorType ?? "None",
+            }));
+
+            setResult({
+              recognizedText: r.text,
+              accuracy: Math.round(pa.accuracyScore),
+              fluency: Math.round(pa.fluencyScore),
+              completeness: Math.round(pa.completenessScore),
+              pronScore: Math.round(pa.pronunciationScore),
+              words,
+            });
+            setStatus("");
+          } else if (r.reason === SpeechSDK.ResultReason.NoMatch) {
+            setStatus("Didn't catch that — please try again.");
+          } else {
+            setStatus("Could not recognize speech. Try again.");
+          }
+          recognizer.close();
+          recognizerRef.current = null;
+          setBusy(false);
+        },
+        (err) => {
+          setStatus("Error: " + err);
+          recognizer.close();
+          recognizerRef.current = null;
+          setBusy(false);
+        }
+      );
+    } catch (err) {
+      setStatus("Error: " + (err as Error).message);
+      setBusy(false);
+    }
+  }
+
+  function nextWord() {
+    setResult(null);
+    setStatus("");
+    setIndex((i) => (i + 1) % LESSON_WORDS.length);
+  }
+
+  // ---- Helpers for display ----
+  const scoreColor = (s: number) =>
+    s >= 80 ? "#22c55e" : s >= 60 ? "#eab308" : "#ef4444";
+
+  // Did the learner say the right word at all? Normalize both sides so
+  // "Happy.", "happy" or "I said happy" all count as a match.
+  const normalize = (s: string) => s.toLowerCase().replace(/[^a-z0-9']+/g, " ").trim();
+  const spokenMatches =
+    !!result &&
+    (normalize(result.recognizedText) === normalize(currentWord) ||
+      normalize(result.recognizedText).split(" ").includes(normalize(currentWord)));
+
+  // 1–5 rating combining meaning (right word) and pronunciation quality.
+  const rating = result ? starRating(spokenMatches, result.pronScore) : 0;
+
+  return (
+    <div className="container">
+      <h1>🗣️ Pronunciation Practice</h1>
+      <p className="subtitle">
+        Say the word — Azure scores how close your pronunciation is.
+      </p>
+
+      <div className="card">
+        <p className="status">
+          Word {index + 1} of {LESSON_WORDS.length}
+        </p>
+        <div className="target-word">{currentWord}</div>
+
+        <div className="btn-row">
+          <button onClick={playReference} disabled={busy}>
+            🔊 Hear it
+          </button>
+          <button onClick={startAssessment} disabled={busy}>
+            {busy ? "Listening…" : "🎤 Say it"}
+          </button>
+          <button onClick={nextWord} disabled={busy} className="ghost">
+            Next word →
+          </button>
+        </div>
+
+        {status && <p className="status">{status}</p>}
+
+        {result && (
+          <div className="result">
+            <p>
+              You said: <strong>&quot;{result.recognizedText || "—"}&quot;</strong>{" "}
+              {spokenMatches ? "✅" : "❌ (expected “" + currentWord + "”)"}
+            </p>
+
+            <div className="big-score" style={{ color: ratingColor(rating) }}>
+              {"★".repeat(rating)}
+              <span className="star-dim">{"★".repeat(5 - rating)}</span>
+            </div>
+            <p className="verdict" style={{ color: ratingColor(rating) }}>
+              {rating}/5 — {RATING_LABELS[rating]}
+            </p>
+
+            <div className="score-grid">
+              <ScoreBar label="Accuracy" value={result.accuracy} color={scoreColor} />
+              <ScoreBar label="Fluency" value={result.fluency} color={scoreColor} />
+              <ScoreBar label="Completeness" value={result.completeness} color={scoreColor} />
+            </div>
+
+            {result.words.length > 0 && (
+              <div className="word-breakdown">
+                <p className="status">Per-word:</p>
+                {result.words.map((w, i) => (
+                  <span
+                    key={i}
+                    className="word-chip"
+                    style={{ borderColor: scoreColor(w.accuracy) }}
+                    title={w.errorType}
+                  >
+                    {w.word} · {w.accuracy}
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      <p className="status">
+        <a href="/" style={{ color: "#60a5fa" }}>
+          ← Back to TTS / STT
+        </a>
+      </p>
+
+      <style>{`
+        .target-word {
+          font-size: 2.5rem;
+          font-weight: 700;
+          text-align: center;
+          padding: 1.5rem 0;
+          letter-spacing: 0.02em;
+        }
+        .btn-row { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+        button.ghost { background: transparent; border: 1px solid #475569; }
+        button.ghost:hover:not(:disabled) { background: #334155; }
+        .big-score {
+          font-size: 3.5rem; font-weight: 800; text-align: center;
+          margin-top: 0.5rem; line-height: 1;
+        }
+        .score-max { font-size: 1.25rem; color: #64748b; font-weight: 500; }
+        .star-dim { color: #334155; }
+        .verdict { text-align: center; font-weight: 600; margin: 0.25rem 0 1rem; }
+        .score-grid { display: flex; flex-direction: column; gap: 0.6rem; }
+        .bar-wrap { }
+        .bar-label { display: flex; justify-content: space-between; font-size: 0.85rem; margin-bottom: 0.2rem; }
+        .bar-track { height: 8px; background: #0f172a; border-radius: 4px; overflow: hidden; }
+        .bar-fill { height: 100%; border-radius: 4px; transition: width 0.4s; }
+        .word-breakdown { margin-top: 1rem; display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center; }
+        .word-chip {
+          font-size: 0.85rem; padding: 0.2rem 0.6rem; border-radius: 999px;
+          border: 1.5px solid; background: #0f172a;
+        }
+      `}</style>
+    </div>
+  );
+}
+
+function ScoreBar({
+  label,
+  value,
+  color,
+}: {
+  label: string;
+  value: number;
+  color: (v: number) => string;
+}) {
+  return (
+    <div className="bar-wrap">
+      <div className="bar-label">
+        <span>{label}</span>
+        <span style={{ color: color(value) }}>{value}</span>
+      </div>
+      <div className="bar-track">
+        <div className="bar-fill" style={{ width: `${value}%`, background: color(value) }} />
+      </div>
+    </div>
+  );
+}
+//// ================= /////
+"use client";
+
+import { useState, useRef } from "react";
 import * as SpeechSDK from "microsoft-cognitiveservices-speech-sdk";
 
 // The lesson: swap these for any words/phrases you want learners to practice.
@@ -135,19 +480,17 @@ function writeRating(accuracy: number): number {
   return 1;
 }
 
-// ---- Q&A practice: text question, real expected-answer audio, scored against its transcript ----
-type QAItem = {
+// ---- Chinese Q&A: text question, real expected-answer audio, scored against its transcript ----
+type ChineseQA = {
   question: string; // text prompt shown to the learner
   answerAudio: string; // path under /public — the expected-answer audio to play back
-  answerText: string; // fallback transcript, used only if answerAudio can't be auto-transcribed
+  answerText: string; // transcript of that answer audio — required by Azure as the scoring reference
 };
 
 // Drop your .mp3/.wav files into public/audio/zh/ and list them here with the
-// question text. The expected transcript is derived automatically from
-// answerAudio at runtime (see transcribeReferenceAudio below), so if you swap
-// the audio file the scoring reference updates with it — answerText is just
-// a fallback for when that transcription fails (e.g. offline, bad file).
-const CHINESE_QA: QAItem[] = [
+// question text and the exact transcript of the answer audio (Azure scores
+// pronunciation against reference TEXT, not against the audio file directly).
+const CHINESE_QA: ChineseQA[] = [
   {
     question: "你今天感觉怎么样?",
     answerAudio: "/audio/zh/a1.mp3",
@@ -155,258 +498,9 @@ const CHINESE_QA: QAItem[] = [
   },
 ];
 
-// Same idea as CHINESE_QA — drop files into public/audio/ja/ and list them
-// here. The transcript is auto-derived from answerAudio at runtime.
-const JAPANESE_QA: QAItem[] = [
-  {
-    question: "今日の気分はどうですか?",
-    answerAudio: "/audio/ja/a1.ogg",
-    answerText: "今日はとても嬉しいです。",
-  },
-];
-
-// Chinese and Japanese don't reliably use spaces between words, so strip all
-// non-letter/non-number characters (whitespace, punctuation) rather than
-// splitting on spaces the way normalize() does for English.
-const normalizeCJK = (s: string) => s.replace(/[^\p{L}\p{N}]/gu, "");
-
-// Azure's file-based recognition only accepts WAV/PCM, so mp3 reference
-// clips get decoded via Web Audio and re-encoded as a mono 16-bit WAV blob.
-function audioBufferToWavBlob(buffer: AudioBuffer): Blob {
-  const numFrames = buffer.length;
-  const channels: Float32Array[] = [];
-  for (let c = 0; c < buffer.numberOfChannels; c++) channels.push(buffer.getChannelData(c));
-
-  const mono = new Float32Array(numFrames);
-  for (let i = 0; i < numFrames; i++) {
-    let sum = 0;
-    for (let c = 0; c < channels.length; c++) sum += channels[c][i];
-    mono[i] = sum / channels.length;
-  }
-
-  const bytesPerSample = 2;
-  const dataSize = numFrames * bytesPerSample;
-  const out = new ArrayBuffer(44 + dataSize);
-  const view = new DataView(out);
-  const writeString = (offset: number, s: string) => {
-    for (let i = 0; i < s.length; i++) view.setUint8(offset + i, s.charCodeAt(i));
-  };
-
-  writeString(0, "RIFF");
-  view.setUint32(4, 36 + dataSize, true);
-  writeString(8, "WAVE");
-  writeString(12, "fmt ");
-  view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true); // PCM
-  view.setUint16(22, 1, true); // mono
-  view.setUint32(24, buffer.sampleRate, true);
-  view.setUint32(28, buffer.sampleRate * bytesPerSample, true);
-  view.setUint16(32, bytesPerSample, true);
-  view.setUint16(34, 16, true); // bits per sample
-  writeString(36, "data");
-  view.setUint32(40, dataSize, true);
-
-  let offset = 44;
-  for (let i = 0; i < numFrames; i++) {
-    const s = Math.max(-1, Math.min(1, mono[i]));
-    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
-    offset += 2;
-  }
-
-  return new Blob([out], { type: "audio/wav" });
-}
-
-// Transcribe a reference-answer audio file (e.g. answerAudio) with Azure so
-// the app can score the learner's speech against what the file actually
-// says, instead of a hand-typed transcript that can drift out of sync.
-async function transcribeReferenceAudio(path: string, language: string): Promise<string> {
-  const res = await fetch(path);
-  if (!res.ok) throw new Error(`Could not load ${path}`);
-  const arrayBuffer = await res.arrayBuffer();
-
-  const audioCtx = new AudioContext();
-  const decoded = await audioCtx.decodeAudioData(arrayBuffer);
-  const wavBlob = audioBufferToWavBlob(decoded);
-  await audioCtx.close();
-
-  const file = new File([wavBlob], "reference.wav", { type: "audio/wav" });
-  const speechConfig = await getSpeechConfig();
-  speechConfig.speechRecognitionLanguage = language;
-  const audioConfig = SpeechSDK.AudioConfig.fromWavFileInput(file);
-  const recognizer = new SpeechSDK.SpeechRecognizer(speechConfig, audioConfig);
-
-  return new Promise<string>((resolve, reject) => {
-    recognizer.recognizeOnceAsync(
-      (r) => {
-        recognizer.close();
-        if (r.reason === SpeechSDK.ResultReason.RecognizedSpeech) resolve(r.text);
-        else reject(new Error("Could not transcribe reference audio"));
-      },
-      (err) => {
-        recognizer.close();
-        reject(new Error(err));
-      }
-    );
-  });
-}
-
-// Shared question-and-answer practice flow (recording, transcription-derived
-// scoring reference, matching) — used for both the Chinese and Japanese
-// sections below, parameterized by the QA list and Azure recognition locale.
-function useQAPractice(qaList: QAItem[], language: string) {
-  const [index, setIndex] = useState(0);
-  const [busy, setBusy] = useState(false);
-  const [status, setStatus] = useState("");
-  const [result, setResult] = useState<Assessment | null>(null);
-  const recognizerRef = useRef<SpeechSDK.SpeechRecognizer | null>(null);
-  const answerTextCache = useRef<Record<string, string>>({});
-
-  const currentQA = qaList[index];
-
-  // The transcript actually used to score against — resolved from the
-  // answerAudio file (see transcribeReferenceAudio), falling back to the
-  // hand-typed answerText until that resolves or if it fails.
-  const [expectedText, setExpectedText] = useState(currentQA.answerText);
-
-  async function getExpectedAnswerText(qa: QAItem): Promise<string> {
-    const cached = answerTextCache.current[qa.answerAudio];
-    if (cached) return cached;
-    try {
-      const text = await transcribeReferenceAudio(qa.answerAudio, language);
-      answerTextCache.current[qa.answerAudio] = text;
-      return text;
-    } catch {
-      return qa.answerText;
-    }
-  }
-
-  // Pre-warm the transcript as soon as a question is shown, so it's usually
-  // already cached by the time the learner hits "Answer it".
-  useEffect(() => {
-    let cancelled = false;
-    setExpectedText(currentQA.answerText);
-    getExpectedAnswerText(currentQA).then((text) => {
-      if (!cancelled) setExpectedText(text);
-    });
-    return () => {
-      cancelled = true;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [index]);
-
-  // ---- Play the reference-answer audio file ----
-  function playAnswerAudio() {
-    setStatus("");
-    new Audio(currentQA.answerAudio).play().catch(() => {
-      setStatus(`⚠️ Couldn't load "${currentQA.answerAudio}" — add the file to public${currentQA.answerAudio}.`);
-    });
-  }
-
-  // ---- Record the learner's spoken answer and score it against the reference transcript ----
-  async function answerQuestion() {
-    setResult(null);
-    setBusy(true);
-    setStatus("Preparing reference answer…");
-
-    try {
-      // Resolve (or re-transcribe from cache) what the reference audio file
-      // actually says, so we grade against the real audio, not stale text.
-      const expected = await getExpectedAnswerText(currentQA);
-      setExpectedText(expected);
-
-      setStatus("🎤 Listening… say your answer.");
-
-      const speechConfig = await getSpeechConfig();
-      speechConfig.speechRecognitionLanguage = language;
-      speechConfig.setProperty(
-        SpeechSDK.PropertyId.SpeechServiceConnection_InitialSilenceTimeoutMs,
-        "10000"
-      );
-      speechConfig.setProperty(
-        SpeechSDK.PropertyId.SpeechServiceConnection_EndSilenceTimeoutMs,
-        "1500"
-      );
-      const audioConfig = SpeechSDK.AudioConfig.fromDefaultMicrophoneInput();
-      const recognizer = new SpeechSDK.SpeechRecognizer(speechConfig, audioConfig);
-      recognizerRef.current = recognizer;
-
-      SpeechSDK.PhraseListGrammar.fromRecognizer(recognizer).addPhrase(expected);
-
-      const pronConfig = new SpeechSDK.PronunciationAssessmentConfig(
-        expected,
-        SpeechSDK.PronunciationAssessmentGradingSystem.HundredMark,
-        SpeechSDK.PronunciationAssessmentGranularity.Phoneme,
-        true
-      );
-      pronConfig.applyTo(recognizer);
-
-      recognizer.recognizeOnceAsync(
-        (r) => {
-          if (r.reason === SpeechSDK.ResultReason.RecognizedSpeech) {
-            const pa = SpeechSDK.PronunciationAssessmentResult.fromResult(r);
-            const words: WordScore[] = (pa.detailResult?.Words || []).map((w) => ({
-              word: w.Word,
-              accuracy: Math.round(w.PronunciationAssessment?.AccuracyScore ?? 0),
-              errorType: w.PronunciationAssessment?.ErrorType ?? "None",
-            }));
-
-            setResult({
-              recognizedText: r.text,
-              accuracy: Math.round(pa.accuracyScore),
-              fluency: Math.round(pa.fluencyScore),
-              completeness: Math.round(pa.completenessScore),
-              pronScore: Math.round(pa.pronunciationScore),
-              words,
-            });
-            setStatus("");
-          } else if (r.reason === SpeechSDK.ResultReason.NoMatch) {
-            setStatus("Didn't catch that — please try again.");
-          } else {
-            setStatus("Could not recognize speech. Try again.");
-          }
-          recognizer.close();
-          recognizerRef.current = null;
-          setBusy(false);
-        },
-        (err) => {
-          setStatus("Error: " + err);
-          recognizer.close();
-          recognizerRef.current = null;
-          setBusy(false);
-        }
-      );
-    } catch (err) {
-      setStatus("Error: " + (err as Error).message);
-      setBusy(false);
-    }
-  }
-
-  function nextQuestion() {
-    setResult(null);
-    setStatus("");
-    setIndex((i) => (i + 1) % qaList.length);
-  }
-
-  // Did the learner's answer match the expected transcript (derived from the
-  // reference answerAudio file, see expectedText above)?
-  const matches = !!result && normalizeCJK(result.recognizedText) === normalizeCJK(expectedText);
-  const rating = result ? starRating(matches, result.pronScore) : 0;
-
-  return {
-    index,
-    total: qaList.length,
-    currentQA,
-    busy,
-    status,
-    result,
-    expectedText,
-    matches,
-    rating,
-    playAnswerAudio,
-    answerQuestion,
-    nextQuestion,
-  };
-}
+// Chinese has no spaces between words, so strip all non-Han/alphanumeric
+// characters (whitespace, punctuation) rather than splitting on spaces.
+const normalizeZh = (s: string) => s.replace(/[^\p{Script=Han}\p{L}\p{N}]/gu, "");
 
 export default function Practice() {
   const [index, setIndex] = useState(0);
@@ -418,10 +512,14 @@ export default function Practice() {
   const [writeResult, setWriteResult] = useState<WriteResult | null>(null);
   const recognizerRef = useRef<SpeechSDK.SpeechRecognizer | null>(null);
 
-  const currentWord = LESSON_WORDS[index];
+  const [zhIndex, setZhIndex] = useState(0);
+  const [zhBusy, setZhBusy] = useState(false);
+  const [zhStatus, setZhStatus] = useState("");
+  const [zhResult, setZhResult] = useState<Assessment | null>(null);
+  const zhRecognizerRef = useRef<SpeechSDK.SpeechRecognizer | null>(null);
 
-  const zh = useQAPractice(CHINESE_QA, "zh-CN");
-  const ja = useQAPractice(JAPANESE_QA, "ja-JP");
+  const currentWord = LESSON_WORDS[index];
+  const currentQA = CHINESE_QA[zhIndex];
 
   // ---- Play the correct pronunciation (so the learner hears the target) ----
   async function playReference() {
@@ -561,6 +659,92 @@ export default function Practice() {
     setWriteResult({ typedText: writtenText, accuracy, ops });
   }
 
+  // ---- Play a real audio file (question prompt or model answer) ----
+  function playAudioFile(path: string) {
+    setZhStatus("");
+    new Audio(path).play().catch(() => {
+      setZhStatus(`⚠️ Couldn't load "${path}" — add the file to public${path}.`);
+    });
+  }
+
+  // ---- Record the learner's spoken answer and score it against the known transcript ----
+  async function answerQuestion() {
+    setZhResult(null);
+    setZhBusy(true);
+    setZhStatus("🎤 Listening… say your answer.");
+
+    try {
+      const speechConfig = await getSpeechConfig();
+      speechConfig.speechRecognitionLanguage = "zh-CN";
+      speechConfig.setProperty(
+        SpeechSDK.PropertyId.SpeechServiceConnection_InitialSilenceTimeoutMs,
+        "10000"
+      );
+      speechConfig.setProperty(
+        SpeechSDK.PropertyId.SpeechServiceConnection_EndSilenceTimeoutMs,
+        "1500"
+      );
+      const audioConfig = SpeechSDK.AudioConfig.fromDefaultMicrophoneInput();
+      const recognizer = new SpeechSDK.SpeechRecognizer(speechConfig, audioConfig);
+      zhRecognizerRef.current = recognizer;
+
+      SpeechSDK.PhraseListGrammar.fromRecognizer(recognizer).addPhrase(currentQA.answerText);
+
+      const pronConfig = new SpeechSDK.PronunciationAssessmentConfig(
+        currentQA.answerText,
+        SpeechSDK.PronunciationAssessmentGradingSystem.HundredMark,
+        SpeechSDK.PronunciationAssessmentGranularity.Phoneme,
+        true
+      );
+      pronConfig.applyTo(recognizer);
+
+      recognizer.recognizeOnceAsync(
+        (r) => {
+          if (r.reason === SpeechSDK.ResultReason.RecognizedSpeech) {
+            const pa = SpeechSDK.PronunciationAssessmentResult.fromResult(r);
+            const words: WordScore[] = (pa.detailResult?.Words || []).map((w) => ({
+              word: w.Word,
+              accuracy: Math.round(w.PronunciationAssessment?.AccuracyScore ?? 0),
+              errorType: w.PronunciationAssessment?.ErrorType ?? "None",
+            }));
+
+            setZhResult({
+              recognizedText: r.text,
+              accuracy: Math.round(pa.accuracyScore),
+              fluency: Math.round(pa.fluencyScore),
+              completeness: Math.round(pa.completenessScore),
+              pronScore: Math.round(pa.pronunciationScore),
+              words,
+            });
+            setZhStatus("");
+          } else if (r.reason === SpeechSDK.ResultReason.NoMatch) {
+            setZhStatus("Didn't catch that — please try again.");
+          } else {
+            setZhStatus("Could not recognize speech. Try again.");
+          }
+          recognizer.close();
+          zhRecognizerRef.current = null;
+          setZhBusy(false);
+        },
+        (err) => {
+          setZhStatus("Error: " + err);
+          recognizer.close();
+          zhRecognizerRef.current = null;
+          setZhBusy(false);
+        }
+      );
+    } catch (err) {
+      setZhStatus("Error: " + (err as Error).message);
+      setZhBusy(false);
+    }
+  }
+
+  function nextQuestion() {
+    setZhResult(null);
+    setZhStatus("");
+    setZhIndex((i) => (i + 1) % CHINESE_QA.length);
+  }
+
   // ---- Helpers for display ----
   const scoreColor = (s: number) =>
     s >= 80 ? "#22c55e" : s >= 60 ? "#eab308" : "#ef4444";
@@ -578,6 +762,11 @@ export default function Practice() {
 
   // 1–5 rating for the dictation exercise, from word-error-rate accuracy.
   const writeRatingValue = writeResult ? writeRating(writeResult.accuracy) : 0;
+
+  // Did the learner's answer match the expected Chinese transcript?
+  const zhMatches =
+    !!zhResult && normalizeZh(zhResult.recognizedText) === normalizeZh(currentQA.answerText);
+  const zhRating = zhResult ? starRating(zhMatches, zhResult.pronScore) : 0;
 
   return (
     <div className="container">
@@ -733,110 +922,49 @@ export default function Practice() {
       <div className="card">
         <h2 className="section-title">🇨🇳 Chinese Q&A Practice</h2>
         <p className="status">
-          Question {zh.index + 1} of {zh.total}
+          Question {zhIndex + 1} of {CHINESE_QA.length}
         </p>
-        <div className="target-word">{zh.currentQA.question}</div>
+        <div className="target-word">{currentQA.question}</div>
 
         <div className="btn-row">
-          <button onClick={zh.playAnswerAudio} disabled={zh.busy}>
+          <button onClick={() => playAudioFile(currentQA.answerAudio)} disabled={zhBusy}>
             🔊 Hear expected answer
           </button>
-          <button onClick={zh.answerQuestion} disabled={zh.busy}>
-            {zh.busy ? "Listening…" : "🎤 Answer it"}
+          <button onClick={answerQuestion} disabled={zhBusy}>
+            {zhBusy ? "Listening…" : "🎤 Answer it"}
           </button>
-          <button onClick={zh.nextQuestion} disabled={zh.busy} className="ghost">
+          <button onClick={nextQuestion} disabled={zhBusy} className="ghost">
             Next question →
           </button>
         </div>
 
-        {zh.status && <p className="status">{zh.status}</p>}
+        {zhStatus && <p className="status">{zhStatus}</p>}
 
-        {zh.result && (
+        {zhResult && (
           <div className="result">
             <p>
-              You said: <strong>&quot;{zh.result.recognizedText || "—"}&quot;</strong>{" "}
-              {zh.matches ? "✅" : "❌ (expected “" + zh.expectedText + "”)"}
+              You said: <strong>&quot;{zhResult.recognizedText || "—"}&quot;</strong>{" "}
+              {zhMatches ? "✅" : "❌ (expected “" + currentQA.answerText + "”)"}
             </p>
 
-            <div className="big-score" style={{ color: ratingColor(zh.rating) }}>
-              {"★".repeat(zh.rating)}
-              <span className="star-dim">{"★".repeat(5 - zh.rating)}</span>
+            <div className="big-score" style={{ color: ratingColor(zhRating) }}>
+              {"★".repeat(zhRating)}
+              <span className="star-dim">{"★".repeat(5 - zhRating)}</span>
             </div>
-            <p className="verdict" style={{ color: ratingColor(zh.rating) }}>
-              {zh.rating}/5 — {RATING_LABELS[zh.rating]}
+            <p className="verdict" style={{ color: ratingColor(zhRating) }}>
+              {zhRating}/5 — {RATING_LABELS[zhRating]}
             </p>
 
             <div className="score-grid">
-              <ScoreBar label="Accuracy" value={zh.result.accuracy} color={scoreColor} />
-              <ScoreBar label="Fluency" value={zh.result.fluency} color={scoreColor} />
-              <ScoreBar label="Completeness" value={zh.result.completeness} color={scoreColor} />
+              <ScoreBar label="Accuracy" value={zhResult.accuracy} color={scoreColor} />
+              <ScoreBar label="Fluency" value={zhResult.fluency} color={scoreColor} />
+              <ScoreBar label="Completeness" value={zhResult.completeness} color={scoreColor} />
             </div>
 
-            {zh.result.words.length > 0 && (
+            {zhResult.words.length > 0 && (
               <div className="word-breakdown">
                 <p className="status">Per-character:</p>
-                {zh.result.words.map((w, i) => (
-                  <span
-                    key={i}
-                    className="word-chip"
-                    style={{ borderColor: scoreColor(w.accuracy) }}
-                    title={w.errorType}
-                  >
-                    {w.word} · {w.accuracy}
-                  </span>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
-      </div>
-
-      <div className="card">
-        <h2 className="section-title">🇯🇵 Japanese Q&A Practice</h2>
-        <p className="status">
-          Question {ja.index + 1} of {ja.total}
-        </p>
-        <div className="target-word">{ja.currentQA.question}</div>
-
-        <div className="btn-row">
-          <button onClick={ja.playAnswerAudio} disabled={ja.busy}>
-            🔊 Hear expected answer
-          </button>
-          <button onClick={ja.answerQuestion} disabled={ja.busy}>
-            {ja.busy ? "Listening…" : "🎤 Answer it"}
-          </button>
-          <button onClick={ja.nextQuestion} disabled={ja.busy} className="ghost">
-            Next question →
-          </button>
-        </div>
-
-        {ja.status && <p className="status">{ja.status}</p>}
-
-        {ja.result && (
-          <div className="result">
-            <p>
-              You said: <strong>&quot;{ja.result.recognizedText || "—"}&quot;</strong>{" "}
-              {ja.matches ? "✅" : "❌ (expected “" + ja.expectedText + "”)"}
-            </p>
-
-            <div className="big-score" style={{ color: ratingColor(ja.rating) }}>
-              {"★".repeat(ja.rating)}
-              <span className="star-dim">{"★".repeat(5 - ja.rating)}</span>
-            </div>
-            <p className="verdict" style={{ color: ratingColor(ja.rating) }}>
-              {ja.rating}/5 — {RATING_LABELS[ja.rating]}
-            </p>
-
-            <div className="score-grid">
-              <ScoreBar label="Accuracy" value={ja.result.accuracy} color={scoreColor} />
-              <ScoreBar label="Fluency" value={ja.result.fluency} color={scoreColor} />
-              <ScoreBar label="Completeness" value={ja.result.completeness} color={scoreColor} />
-            </div>
-
-            {ja.result.words.length > 0 && (
-              <div className="word-breakdown">
-                <p className="status">Per-character:</p>
-                {ja.result.words.map((w, i) => (
+                {zhResult.words.map((w, i) => (
                   <span
                     key={i}
                     className="word-chip"
